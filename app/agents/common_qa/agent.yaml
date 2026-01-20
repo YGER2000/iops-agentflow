@@ -1,0 +1,11 @@
+name: common_agent
+version: 1.0.0
+description: 通识问答智能体,可以回答各种常识性问题,支持多轮对话
+author: 平台团队
+entry_class: CommonQAAgent
+enabled: true
+dependencies: []
+config:
+#  CMDB_API_KEY: ${CMDB_API_KEY}
+#  CMDB_SEARCH_URL: ${CMDB_SEARCH_URL}
+

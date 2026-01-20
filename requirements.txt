@@ -1,0 +1,40 @@
+# python依赖包保存在IPE环境UFS的/xingxj/site-packages.zip中
+# ===== 平台基础依赖 =====
+fastapi==0.120.4
+uvicorn[standard]==0.38.0
+pydantic==2.12.3
+pydantic-settings==2.11.0
+langgraph==1.0.5
+langchain==1.2.0
+langchain-core==1.2.2
+langchain-openai==1.1.4
+redis==7.0.1
+httpx==0.28.1
+python-dotenv==1.2.1
+
+# ===== cmdb_smart_query 智能体依赖 =====
+
+# ===== common_qa 智能体依赖 =====
+
+
+# ===== 基础组件支持（可选） =====
+# MySQL 支持 - 使用 SQLAlchemy 2.0 ORM
+sqlalchemy[asyncio]==2.0.44
+greenlet==3.2.4
+aiomysql==0.3.2
+
+# MongoDB 支持 - 使用 Motor 异步驱动
+# 版本说明：
+# - pymongo 4.7.0 支持 MongoDB 4.0-5.0 (wire version 7-8)
+# - motor 3.5.0 对应 pymongo 4.7.0
+motor==3.5.0
+pymongo==4.7.0
+
+# Apollo 配置中心 - 启用 Apollo 功能时需要安装
+apollo-client==2.1.2
+
+
+# 附件解析
+python-multipart==0.0.20
+openpyxl==3.1.5
+pandas==2.3.3

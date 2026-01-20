@@ -1,0 +1,114 @@
+# 内网专用 Dockerfile - 基于预构建的基础镜像
+# 此文件用于在无法访问外网的环境中构建应用镜像
+FROM 182.214.109.2:8000/docker-release-test/bocomm-iops/agentflow-base:20251217
+
+# 设置环境变量
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TZ=Asia/Shanghai
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制应用代码（仅业务代码，依赖已在基础镜像中）
+COPY --chown=appuser:appuser app ./app
+COPY --chown=appuser:appuser run.py .
+
+# 创建日志目录和 Apollo 缓存目录
+RUN mkdir -p logs .apollo_cache
+
+# 暴露端口
+EXPOSE 8000
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8000/api/v1/health')" || exit 1
+
+# 启动命令
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+# ============================================
+# 内网部署完整流程
+# ============================================
+#
+# 前置条件：已从外网获得基础镜像 tar 文件
+# - agentflow-base-py312.tar
+#
+# ---- 步骤 1：加载基础镜像 ----
+# docker load -i agentflow-base-py312.tar
+#
+# 验证基础镜像已加载：
+# docker images | grep agentflow-base
+# 应该看到：agentflow-base   py312   <IMAGE_ID>   <SIZE>
+#
+# ---- 步骤 2：构建应用镜像 ----
+# docker build -t agentflow:intra -f Dockerfile.intra .
+#
+# 可选：指定自定义基础镜像
+# docker build --build-arg BASE_IMAGE=agentflow-base:py312 -t agentflow:intra -f Dockerfile.intra .
+#
+# ---- 步骤 3：运行应用容器 ----
+# 基础运行：
+# docker run -d \
+#   --name agentflow-app \
+#   -p 8000:8000 \
+#   --env-file .env \
+#   -e HOST=0.0.0.0 \
+#   -e PORT=8000 \
+#   -v ./logs:/app/logs \
+#   -v ./app/agents:/app/app/agents:ro \
+#   --restart unless-stopped \
+#   agentflow:intra
+#
+# 带健康检查的运行：
+# docker run -d \
+#   --name agentflow-app \
+#   -p 8000:8000 \
+#   --env-file .env \
+#   -e HOST=0.0.0.0 \
+#   -e PORT=8000 \
+#   -v ./logs:/app/logs \
+#   -v ./app/agents:/app/app/agents:ro \
+#   --restart unless-stopped \
+#   --health-cmd="python -c \"import requests; requests.get('http://localhost:8000/api/v1/health')\"" \
+#   --health-interval=30s \
+#   --health-timeout=10s \
+#   --health-retries=3 \
+#   --health-start-period=10s \
+#   agentflow:intra
+#
+# ---- 步骤 4：验证运行状态 ----
+# 查看容器状态：
+# docker ps -a | grep agentflow
+#
+# 查看日志：
+# docker logs -f agentflow-app
+#
+# 查看健康状态：
+# docker inspect --format='{{.State.Health.Status}}' agentflow-app
+#
+# ---- 常用管理命令 ----
+# 停止容器：
+# docker stop agentflow-app
+#
+# 删除容器：
+# docker rm agentflow-app
+#
+# 更新应用（保持基础镜像不变）：
+# 1) 停止并删除旧容器
+# docker stop agentflow-app && docker rm agentflow-app
+# 2) 重新构建应用镜像
+# docker build -t agentflow:intra -f Dockerfile.intra .
+# 3) 重新运行容器
+# docker run -d ... agentflow:intra
+#
+# ============================================
+# 镜像说明
+# ============================================
+# 此应用镜像基于 agentflow-base:py312 构建
+# 仅包含业务代码，不包含 Python 依赖
+# 
+# 应用镜像大小：约 50-100 MB（仅代码部分）
+# 总镜像大小：基础镜像大小 + 应用镜像大小
+#

@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  # 应用服务 - 生产环境
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentflow:latest
+    container_name: agentflow-app
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # 覆盖部分环境变量（容器内使用）
+      - HOST=0.0.0.0
+      - PORT=8000
+      # Redis 连接（如果使用容器化的 Redis）
+      # - REDIS_HOST=redis
+      # - REDIS_PORT=6379
+    volumes:
+      # 持久化日志目录
+      - ./logs:/app/logs
+      # 如果需要持久化智能体配置
+      - ./app/agents:/app/app/agents:ro
+    networks:
+      - agentflow-network
+    # 依赖服务（如果使用 docker-compose 启动 Redis）
+    # depends_on:
+    #   - redis
+    profiles:
+      - production
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/api/v1/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # 应用服务 - 开发环境
+  app-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: agentflow:dev
+    container_name: agentflow-app-dev
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=DEBUG
+    volumes:
+      # 挂载源代码支持热重载
+      - ./app:/app/app
+      - ./run.py:/app/run.py
+      - ./logs:/app/logs
+      - ./tests:/app/tests
+    networks:
+      - agentflow-network
+    profiles:
+      - development
+    stdin_open: true
+    tty: true
+
+  # Redis 服务（可选 - 用于演示，生产环境建议使用外部 Redis）
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: agentflow-redis
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis-data:/data
+  #   command: redis-server --appendonly yes
+  #   networks:
+  #     - agentflow-network
+  #   profiles:
+  #     - development
+  #     - production
+
+networks:
+  agentflow-network:
+    driver: bridge
+
+# volumes:
+#   redis-data:
+#     driver: local
+
