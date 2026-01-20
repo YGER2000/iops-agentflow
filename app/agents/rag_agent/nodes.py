@@ -131,6 +131,12 @@ async def judge_answerable_node(state: RAGState) -> RAGState:
     can_answer = bool(state.get("retrieved"))
     answer_source = "kb" if can_answer else "llm_fallback"
     fallback_reason = None if can_answer else "未检索到相关内容"
+    # 记录 retrieved 的简要信息，便于排查中间状态是否丢失
+    try:
+        retrieved_preview = state.get("retrieved")
+        logger.debug("[judge_answerable_node] retrieved count=%s, sample=%s", len(retrieved_preview) if retrieved_preview else 0, (retrieved_preview[:2] if retrieved_preview else []))
+    except Exception:
+        logger.debug("[judge_answerable_node] 无法获取 retrieved 预览")
     logger.debug("[judge_answerable_node]正在执行，answer_source=%s", answer_source)
     return {
         **state,
@@ -168,11 +174,13 @@ async def compose_answer_node(state: RAGState) -> RAGState:
             resp_content = resp.content
             
         answer = _llm_service.clean_response(resp_content)
+        # 保持原始的 retrieved 信息，不要在回退路径中清空，便于后续处理和记录参考来源
+        logger.debug("[compose_answer_node] llm_fallback, preserved retrieved count=%s", len(state.get("retrieved") or []))
         return {
             **state,
             "answer": answer,
-            "references":[],
-            "retrieved":[],
+            "references": state.get("references") or [],
+            "retrieved": state.get("retrieved") or [],
             "answer_source": "llm_fallback"
         }
 
@@ -210,4 +218,4 @@ async def compose_answer_node(state: RAGState) -> RAGState:
             logger.warning("[compose_answer_node] 普通调用也失败，使用参考文段代替: %s", e2)
             answer = retrieved or "未检索到相关内容"
 
-    return {**state, "answer": answer, "answer_source": "kb"}
+    return {**state, "answer": answer, "answer_source": "kb", "retrieved": retrieved}

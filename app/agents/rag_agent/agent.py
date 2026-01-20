@@ -231,14 +231,26 @@ class RAGAgent(AgentBase):
         # 用于存储最终结果和流式输出
         full_response = ""
         final_state = None
-
+        answer_streaming_completed = False
+        stream_ended = False
         try:
             # 使用astream_events实现真正的流式输出
             async for event in graph.astream_events(
                 initial_state,
                 version="v2"
             ):
-                # logger.debug(f"[stream] event: {event}")
+                # 记录事件类型与关键信息，便于排查最终 output 的结构
+                try:
+                    evt_type = event.get("event")
+                    evt_data = event.get("data") or {}
+                    out = evt_data.get("output") if isinstance(evt_data, dict) else None
+                    if isinstance(out, dict):
+                        out_keys = list(out.keys())
+                    else:
+                        out_keys = type(out)
+                    logger.debug("[stream] event=%s, data_keys=%s, output_keys=%s", evt_type, list(evt_data.keys()) if isinstance(evt_data, dict) else None, out_keys)
+                except Exception as _:
+                    logger.debug("[stream] event debug failed")
                 
                 # 处理LLM流式输出
                 if event["event"] == "on_chat_model_stream":
@@ -269,11 +281,24 @@ class RAGAgent(AgentBase):
                 # 获取最终状态结果
                 elif event["event"] == "on_end":
                     final_state = event["data"].get("output")
+                    # 记录 final_state 的简要内容，确认 retrieved/references 是否保留
+                    try:
+                        if final_state:
+                            logger.debug("[stream] on_end final_state keys=%s", list(final_state.keys()))
+                            logger.debug("[stream] on_end retrieved preview=%s", (final_state.get("retrieved") or [])[:2])
+                            logger.debug("[stream] on_end references preview=%s", (final_state.get("references") or [])[:2])
+                        else:
+                            logger.debug("[stream] on_end final_state is None or empty")
+                    except Exception as e:
+                        logger.debug("[stream] logging final_state failed: %s", e)
+                    answer_streaming_completed = True
+                    stream_ended = True
+                
 
             # ========== 流式输出完成后，拼接参考来源 ==========
-            if final_state:
+            if answer_streaming_completed:
                 # 获取检索结果
-                retrieved = final_state.get("retrieved") or []
+                retrieved = final_state.get("retrieved") if final_state else []
                 
                 if retrieved:
                     # 构建参考来源部分
@@ -286,12 +311,12 @@ class RAGAgent(AgentBase):
                     references_str = "\n".join(reference_content)
                     references_part = f"\n\n:::card 参考来源\n{references_str}\n:::"
                     
-                    # 流式输出参考来源部分
-                    for char in references_part:
-                        yield {
-                            "type": "message", 
-                            "data": char
-                        }
+                    # 输出参考来源部分
+                    
+                    yield {
+                        "type": "message",
+                        "data": references_part
+                    }
                     
                     # 组合完整消息用于保存
                     formatted_message = f"\n{full_response}{references_part}"
