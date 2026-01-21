@@ -1,112 +1,148 @@
-import logging
 import json
-import os
-from typing import Dict, Any, AsyncGenerator
+import logging
+from typing import Dict, Any, AsyncGenerator, Optional, List
+
 from langgraph.graph import StateGraph
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 from app.agents.base import AgentBase
-from app.schemas.agent import AgentResponse
 from app.core.chat_history import get_chat_history_manager
-from .graph import build_rag_graph
-from .state import RAGState
-from .services.req_client import ReqSearchClient
-from .services.message_formatter import format_response_message
-
 from app.core.models import SharedConversationHistory
+
+from .graph import build_rag_graph
+from .state import RAGState, RetrievedSlice
+
+# 检索客户端（本目录自包含实现，避免依赖任何“旧目录”）
+from .services.req_client import ReqSearchClient
 
 logger = logging.getLogger(__name__)
 
 
+def _build_references_card_from_retrieved(retrieved: List[RetrievedSlice]) -> str:
+    """将 retrieved 构建为前端可渲染的参考来源卡片
+
+    注意：这里严格按你的要求保留原有拼接逻辑与格式，只是从 state 中取数据。
+    """
+    reference_content = []
+    for i, ref in enumerate(retrieved or [], 1):
+        title = ref.get("title", "")
+        content = ref.get("content", ref.get("para", ""))
+        reference_content.append(f"\n\n:::modal [{i}]{title}\n{content}\n\n:::\n\n")
+
+    references_str = "\n".join(reference_content)
+    references_part = f"\n\n:::card 参考来源\n{references_str}\n:::"
+    return references_part
+
+
 class RAGAgent(AgentBase):
-    """通识问答智能体"""
+    """RAG 问答智能体
+
+    设计原则：
+    - 持久化/历史对话逻辑与 `common_qa` 保持一致，避免出现“一个智能体一套逻辑”的维护灾难。
+    - 图/节点尽量简洁，最大化复用既有组件（ReqSearchClient、提示词文件等）。
+    - 流式输出修复：只流式输出回答正文；回答完成后再追加参考来源卡片；不再输出改写查询。
+    """
 
     def __init__(self):
         super().__init__(
             name="rag_agent",
-            description="基于检索增强生成的问答智能体，支持输入标签进行过滤检索。"
+            description="基于检索增强生成的问答智能体，支持输入标签进行过滤检索，支持流式回答与参考来源输出。"
         )
-        self._graph: StateGraph | None = None
-        self._req_client: ReqSearchClient | None = None
-        self.chat_history = None
-        self._system_prompt: str | None = None
+        self._graph: Optional[StateGraph] = None
+        self._req_client: Optional[ReqSearchClient] = None
+        self.chat_history = None  # 延迟初始化（异步）
+        self._system_prompt: Optional[str] = None
 
-    async def _ensure_chat_history(self):
+    async def _ensure_chat_history(self) -> None:
         """确保 chat_history 已初始化"""
         if self.chat_history is None:
             self.chat_history = await get_chat_history_manager()
-    
+            logger.info("[agent] chat_history initialized")
+
     @property
-    def system_prompt(self):
+    def system_prompt(self) -> str:
         """懒加载系统提示词"""
-        # 原始
         if self._system_prompt is None:
             self._system_prompt = self.load_prompt("system.md")
+            logger.info("[agent] system prompt loaded")
         return self._system_prompt
 
     @property
     def req_client(self) -> ReqSearchClient:
+        """懒加载检索客户端"""
         if self._req_client is None:
             self._req_client = ReqSearchClient(
                 base_url=self.config.get("RAG_AGENT_BASE_URL"),
                 user_id=self.config.get("RAG_AGENT_USER_ID"),
-                timeout_seconds=8
+                timeout_seconds=8,
+            )
+            logger.info(
+                "[agent] req_client initialized | base_url=%s | user_id=%s",
+                self.config.get("RAG_AGENT_BASE_URL"),
+                self.config.get("RAG_AGENT_USER_ID"),
             )
         return self._req_client
 
     def build_graph(self) -> StateGraph:
-        """构建图"""
+        """构建并编译图（只做一次）"""
         if self._graph is None:
+            logger.info("[agent] build_graph (compile) start")
             self._graph = build_rag_graph(
                 llm_service=self.llm,
-                req_client=self.req_client
+                req_client=self.req_client,
             ).compile()
+            logger.info("[agent] build_graph (compile) done")
         return self._graph
 
-    async def invoke(
-            self,
-            message: str,
-            thread_id: str,
-            context: Dict[str, Any] = None
-    ) -> str:
-        """调用智能体"""
-        context = context or {}     # 默认为空字典
-        # 确保 chat_history 已初始化
-        await self._ensure_chat_history()
-        logger.debug(f"========== 传入的content:{context} ==============")
-        is_new_conversation = context.get('is_new_conversation', False)
-        # ========== 持久化用户消息（共享表） ==========
-        # MySQL: 保存用户消息到共享表
-        try:
-            mysql = self.get_service("mysql")
-            if mysql:
-                async with mysql.get_session() as session:
-                    user_msg = SharedConversationHistory(
-                        thread_id=thread_id,
-                        agent_name=self.name,  # 使用 agent_name 区分不同智能体
-                        role="user",
-                        content=message,
-                        extra_metadata=json.dumps({"tag": context.get("tag")}) if context.get("tag") else None
-                    )
-                    session.add(user_msg)
-                    await session.commit()
-                    logger.debug("MySQL: 用户消息已保存到共享表")
-        except Exception as e:
-            logger.error(f"MySQL 保存用户消息失败: {e}")
+    async def invoke(self, message: str, thread_id: str, context: Dict[str, Any] = None) -> str:
+        """非流式调用
 
+        API 层当前声明 `response_model=str`，所以这里保持返回 string（与现有系统兼容）。
+        """
+        context = context or {}
+        await self._ensure_chat_history()
+
+        is_new_conversation = context.get("is_new_conversation", False)
+        logger.info(
+            "[invoke] start | thread_id=%s | is_new_conversation=%s | has_tag=%s",
+            thread_id,
+            is_new_conversation,
+            bool(context.get("tag")),
+        )
+
+        # ========== 持久化用户消息（共享表） ==========
+        try:
+            async with self.mysql.get_session() as session:
+                user_msg = SharedConversationHistory(
+                    thread_id=thread_id,
+                    agent_name=self.name,
+                    role="user",
+                    content=message,
+                    extra_metadata=json.dumps(context) if context else None,
+                )
+                session.add(user_msg)
+                await session.commit()
+            logger.info("[invoke] MySQL saved user message")
+        except Exception as e:
+            logger.error("[invoke] MySQL save user message failed | err=%s", e, exc_info=True)
+
+        # ========== 历史消息（与 common_qa 一致） ==========
         if is_new_conversation:
             history_messages = []
-            logger.debug(f"新对话 (thread_id={thread_id})，跳过历史消息查询")
-
+            logger.info("[invoke] new conversation: skip history loading")
         else:
             history_messages = await self.chat_history.get_messages(thread_id)
+            logger.info("[invoke] history loaded | count=%s", len(history_messages))
 
+        if not history_messages:
+            history_messages = [SystemMessage(content=self.system_prompt)]
 
+        # ========== 图调用 ==========
         initial_state: RAGState = {
             "agent_config": self.config,
             "domain_context": None,
             "raw_input": message,
-            "tag": context.get("tag") if context else None,
+            "tag": context.get("tag"),
             "parsed_query": None,
             "rewritten_query": None,
             "retrieved": [],
@@ -115,109 +151,111 @@ class RAGAgent(AgentBase):
             "history_messages": history_messages,
         }
 
-        # ========== 原有逻辑 ==========
         graph = self.get_graph()
         result_state = await graph.ainvoke(initial_state)
 
-        answer = result_state.get("answer")
-        #references = result_state.get("references") or  []
+        answer = (result_state.get("answer") or "").strip()
         retrieved = result_state.get("retrieved") or []
-        # response_data = {
-        #     "rewritten_query": result_state.get("rewritten_query"),
-        #     "references": references,
-        #     "retrieved": result_state.get("retrieved") or [],
-        #     "answer_source": result_state.get("answer_source"),
-        #     "tag": result_state.get("tag"),
-        # }
 
-        # 调用拼接服务，拼接answer和retrieved
-        formatted_message = format_response_message(answer, retrieved)
+        # 拼接参考来源（保持你的原始格式）
+        if retrieved:
+            references_part = _build_references_card_from_retrieved(retrieved)
+            formatted_message = f"\n{answer}{references_part}"
+        else:
+            formatted_message = f"\n{answer}"
 
+        logger.info(
+            "[invoke] graph done | answer_len=%s | retrieved_count=%s | answer_source=%s",
+            len(answer),
+            len(retrieved),
+            result_state.get("answer_source"),
+        )
+
+        # ========== 保存 Redis 历史（与 common_qa 一致） ==========
         try:
+            await self.chat_history.add_message(thread_id, HumanMessage(content=message))
             await self.chat_history.add_message(thread_id, AIMessage(content=formatted_message))
+            logger.info("[invoke] redis history saved")
         except Exception as e:
-            logger.warning(f"写入会话历史失败(ai): {e}")
+            logger.warning("[invoke] redis history save failed | err=%s", e, exc_info=True)
 
-        # ========== 持久化AI回复（共享表） ==========
-        # MySQL: 保存AI回复到共享表
+        # ========== 持久化 AI 回复（共享表） ==========
         try:
-            mysql = self.get_service("mysql")
-            if mysql:
-                async with mysql.get_session() as session:
-                    ai_msg = SharedConversationHistory(
-                        thread_id=thread_id,
-                        agent_name=self.name,  # 使用 agent_name 区分不同智能体
-                        role="assistant",
-                        content=formatted_message,  # 使用拼接后的消息
-                        extra_metadata=json.dumps(
-                            {
-                                "tag": context.get("tag"),
-                                "rewritten_query": result_state.get("rewritten_query"),
-                                "can_answer": result_state.get("can_answer")
-                            }
-                        )
-                    )
-                    session.add(ai_msg)
-                    await session.commit()
-                    logger.debug("MySQL: AI回复已保存到共享表")
+            async with self.mysql.get_session() as session:
+                ai_msg = SharedConversationHistory(
+                    thread_id=thread_id,
+                    agent_name=self.name,
+                    role="assistant",
+                    content=formatted_message,
+                    extra_metadata=json.dumps(
+                        {
+                            "tag": context.get("tag"),
+                            "rewritten_query": result_state.get("rewritten_query"),
+                            "can_answer": result_state.get("can_answer"),
+                            "answer_source": result_state.get("answer_source"),
+                            "fallback_reason": result_state.get("fallback_reason"),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                session.add(ai_msg)
+                await session.commit()
+            logger.info("[invoke] MySQL saved assistant message")
         except Exception as e:
-            logger.error(f"MySQL 保存AI回复失败: {e}")
+            logger.error("[invoke] MySQL save assistant message failed | err=%s", e, exc_info=True)
 
-        # return AgentResponse(
-        #     message=answer,
-        #     thread_id=thread_id,
-        #     need_user_action=False,
-        #     data=response_data,
-        #     metadata={
-        #         "can_answer": result_state.get("can_answer"),
-        #         "fallback_reason": result_state.get("fallback_reason"),
-        #         "answer_source": result_state.get("answer_source"),
-        #     }
-        # )
         return formatted_message
 
-    async def stream(
-            self,
-            message: str,
-            thread_id: str,
-            context: Dict[str, Any] = None
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """流式调用智能体 - 实现真正的流式输出"""
-        # 确保 chat_history 已初始化
+    async def stream(self, message: str, thread_id: str, context: Dict[str, Any] = None) -> AsyncGenerator[Dict[str, Any], None]:
+        """流式调用
+
+        关键修复点：
+        - rewrite_query 节点是非流式（ainvoke），因此不会产生 on_chat_model_stream → 不会把“改写查询”流到前端。
+        - 只有 compose_answer 节点使用 streaming → 前端只看到答案 token。
+        - 当图执行结束（on_end）后，**立刻输出参考来源卡片**（type=message）。
+        """
+        context = context or {}
         await self._ensure_chat_history()
+
+        is_new_conversation = context.get("is_new_conversation", False)
+        logger.info(
+            "[stream] start | thread_id=%s | is_new_conversation=%s",
+            thread_id,
+            is_new_conversation,
+        )
 
         # ========== 持久化用户消息（共享表） ==========
         try:
-            mysql = self.get_service("mysql")
-            if mysql:
-                async with mysql.get_session() as session:
-                    user_msg = SharedConversationHistory(
-                        thread_id=thread_id,
-                        agent_name=self.name,
-                        role="user",
-                        content=message,
-                        extra_metadata=json.dumps(context) if context else None
-                    )
-                    session.add(user_msg)
-                    await session.commit()
-                    logger.debug("MySQL: 用户消息已保存到共享表（流式）")
+            async with self.mysql.get_session() as session:
+                user_msg = SharedConversationHistory(
+                    thread_id=thread_id,
+                    agent_name=self.name,
+                    role="user",
+                    content=message,
+                    extra_metadata=json.dumps(context) if context else None,
+                )
+                session.add(user_msg)
+                await session.commit()
+            logger.info("[stream] MySQL saved user message")
         except Exception as e:
-            logger.error(f"MySQL 保存用户消息失败（流式）: {e}")
+            logger.error("[stream] MySQL save user message failed | err=%s", e, exc_info=True)
 
-        # ========== 原有逻辑 ==========
-        # 获取历史消息
-        is_new_conversation = context and context.get('is_new_conversation', False)
+        # ========== 历史消息 ==========
         if is_new_conversation:
             history_messages = []
-            logger.debug(f"新对话 (thread_id={thread_id})，跳过历史消息查询（流式）")
+            logger.info("[stream] new conversation: skip history loading")
         else:
             history_messages = await self.chat_history.get_messages(thread_id)
+            logger.info("[stream] history loaded | count=%s", len(history_messages))
+
+        if not history_messages:
+            history_messages = [SystemMessage(content=self.system_prompt)]
 
         initial_state: RAGState = {
             "agent_config": self.config,
             "domain_context": None,
             "raw_input": message,
-            "tag": context.get("tag") if context else None,
+            "tag": context.get("tag"),
             "parsed_query": None,
             "rewritten_query": None,
             "retrieved": [],
@@ -227,145 +265,101 @@ class RAGAgent(AgentBase):
         }
 
         graph = self.get_graph()
-        
-        # 用于存储最终结果和流式输出
-        full_response = ""
-        final_state = None
-        answer_streaming_completed = False
-        stream_ended = False
-        try:
-            # 使用astream_events实现真正的流式输出
-            async for event in graph.astream_events(
-                initial_state,
-                version="v2"
-            ):
-                # 记录事件类型与关键信息，便于排查最终 output 的结构
-                try:
-                    evt_type = event.get("event")
-                    evt_data = event.get("data") or {}
-                    out = evt_data.get("output") if isinstance(evt_data, dict) else None
-                    if isinstance(out, dict):
-                        out_keys = list(out.keys())
-                    else:
-                        out_keys = type(out)
-                    logger.debug("[stream] event=%s, data_keys=%s, output_keys=%s", evt_type, list(evt_data.keys()) if isinstance(evt_data, dict) else None, out_keys)
-                except Exception as _:
-                    logger.debug("[stream] event debug failed")
-                
-                # 处理LLM流式输出
-                if event["event"] == "on_chat_model_stream":
-                    try:
-                        chunk_data = event["data"]["chunk"]
-                        
-                        if chunk_data is None:
-                            continue
-                        
-                        if hasattr(chunk_data, "content"):
-                            content = chunk_data.content
-                        else:
-                            try:
-                                content = str(chunk_data)
-                            except:
-                                content = ""
-                        
-                        if content:
-                            full_response += content
-                            yield {
-                                "type": "message",
-                                "data": content
-                            }
-                    except Exception as e:
-                        logger.warning(f"[stream] 处理chunk出错: {e}")
-                        continue
-                
-                # 获取最终状态结果
-                elif event["event"] == "on_end":
-                    final_state = event["data"].get("output")
-                    # 记录 final_state 的简要内容，确认 retrieved/references 是否保留
-                    try:
-                        if final_state:
-                            logger.debug("[stream] on_end final_state keys=%s", list(final_state.keys()))
-                            logger.debug("[stream] on_end retrieved preview=%s", (final_state.get("retrieved") or [])[:2])
-                            logger.debug("[stream] on_end references preview=%s", (final_state.get("references") or [])[:2])
-                        else:
-                            logger.debug("[stream] on_end final_state is None or empty")
-                    except Exception as e:
-                        logger.debug("[stream] logging final_state failed: %s", e)
-                    answer_streaming_completed = True
-                    stream_ended = True
-                
+        full_answer = ""
+        final_state: Optional[Dict[str, Any]] = None
 
-            # ========== 流式输出完成后，拼接参考来源 ==========
-            if answer_streaming_completed:
-                # 获取检索结果
-                retrieved = final_state.get("retrieved") if final_state else []
-                
-                if retrieved:
-                    # 构建参考来源部分
-                    reference_content = []
-                    for i, ref in enumerate(retrieved, 1):
-                        title = ref.get("title", "")
-                        content = ref.get("content", ref.get("para", ""))
-                        reference_content.append(f"\n\n:::modal [{i}]{title}\n{content}\n\n:::\n\n")
-                    
-                    references_str = "\n".join(reference_content)
-                    references_part = f"\n\n:::card 参考来源\n{references_str}\n:::"
-                    
-                    # 输出参考来源部分
-                    
-                    yield {
-                        "type": "message",
-                        "data": references_part
-                    }
-                    
-                    # 组合完整消息用于保存
-                    formatted_message = f"\n{full_response}{references_part}"
-                else:
-                    formatted_message = f"\n{full_response}"
-                    
-                # 保存对话历史到 Redis
+        try:
+            async for event in graph.astream_events(initial_state, version="v2"):
+                evt_type = event.get("event")
+                evt_data = event.get("data") or {}
+
+                # 详细日志：用于排查事件流结构与最终 output 是否包含 retrieved/references
+                # try:
+                #     if evt_type in ("on_chat_model_stream", "on_end"):
+                #         logger.debug(
+                #             "[stream] event=%s | data_keys=%s",
+                #             evt_type,
+                #             list(evt_data.keys()) if isinstance(evt_data, dict) else None,
+                #         )
+                # except Exception:
+                #     pass
+
+                # ========== 透传模型 token ==========
+                if evt_type == "on_chat_model_stream":
+                    chunk = evt_data.get("chunk")
+                    if chunk is None:
+                        continue
+                    content = getattr(chunk, "content", None)
+                    if content:
+                        full_answer += content
+                        yield {"type": "message", "data": content}
+
+                # ========== 获取最终状态 ==========
+                if evt_type == "on_end":
+                    final_state = evt_data.get("output") if isinstance(evt_data, dict) else None
+                    if isinstance(final_state, dict):
+                        logger.info(
+                            "[stream] on_end | keys=%s | retrieved_count=%s",
+                            list(final_state.keys()),
+                            len(final_state.get("retrieved") or []),
+                        )
+                    else:
+                        logger.warning("[stream] on_end without dict output | output_type=%s", type(final_state))
+
+            # ========== 回答结束后，追加参考来源 ==========
+            retrieved = (final_state or {}).get("retrieved") or []
+            references_part = ""
+            if retrieved:
+                references_part = _build_references_card_from_retrieved(retrieved)
+                # 注意：必须保持 type 只有 message（按你的约束）
+                yield {"type": "message", "data": references_part}
+
+            # ========== 保存历史与持久化 ==========
+            formatted_message = f"\n{full_answer}{references_part}" if references_part else f"\n{full_answer}"
+
+            try:
                 await self.chat_history.add_message(thread_id, HumanMessage(content=message))
                 await self.chat_history.add_message(thread_id, AIMessage(content=formatted_message))
+                logger.info("[stream] redis history saved")
+            except Exception as e:
+                logger.warning("[stream] redis history save failed | err=%s", e, exc_info=True)
 
-                # ========== 持久化AI回复（共享表） ==========
-                try:
-                    mysql = self.get_service("mysql")
-                    if mysql:
-                        async with mysql.get_session() as session:
-                            ai_msg = SharedConversationHistory(
-                                thread_id=thread_id,
-                                agent_name=self.name,
-                                role="assistant",
-                                content=formatted_message,
-                                extra_metadata=json.dumps({
-                                    "tag": context.get("tag") if context else None,
-                                    "rewritten_query": final_state.get("rewritten_query"),
-                                    "can_answer": final_state.get("can_answer")
-                                })
-                            )
-                            session.add(ai_msg)
-                            await session.commit()
-                            logger.debug("MySQL: AI回复已保存到共享表（流式）")
-                except Exception as e:
-                    logger.error(f"MySQL 保存AI回复失败（流式）: {e}")
+            try:
+                async with self.mysql.get_session() as session:
+                    ai_msg = SharedConversationHistory(
+                        thread_id=thread_id,
+                        agent_name=self.name,
+                        role="assistant",
+                        content=formatted_message,
+                        extra_metadata=json.dumps(
+                            {
+                                "tag": context.get("tag"),
+                                "rewritten_query": (final_state or {}).get("rewritten_query"),
+                                "can_answer": (final_state or {}).get("can_answer"),
+                                "answer_source": (final_state or {}).get("answer_source"),
+                                "fallback_reason": (final_state or {}).get("fallback_reason"),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                    session.add(ai_msg)
+                    await session.commit()
+                logger.info("[stream] MySQL saved assistant message")
+            except Exception as e:
+                logger.error("[stream] MySQL save assistant message failed | err=%s", e, exc_info=True)
 
-                # 发送元数据
-                yield {
-                    "type": "metadata",
-                    "data": {
-                        "thread_id": thread_id,
-                        "can_answer": final_state.get("can_answer"),
-                        "answer_source": final_state.get("answer_source"),
-                        "fallback_reason": final_state.get("fallback_reason")
-                    }
-                }
-            else:
-                # 如果没有获取到最终状态，抛出错误
-                raise Exception("未能获取图执行结果")
+            # ========== 输出元数据 ==========
+            yield {
+                "type": "metadata",
+                "data": {
+                    "thread_id": thread_id,
+                    "can_answer": (final_state or {}).get("can_answer"),
+                    "answer_source": (final_state or {}).get("answer_source"),
+                    "fallback_reason": (final_state or {}).get("fallback_reason"),
+                },
+            }
 
         except Exception as e:
-            logger.error(f"LangGraph流式调用失败（最外层）: {e}")
-            yield {
-                "type": "error",
-                "data": str(e)
-            }
+            logger.error("[stream] LangGraph stream failed | err=%s", e, exc_info=True)
+            yield {"type": "error", "data": str(e)}
+

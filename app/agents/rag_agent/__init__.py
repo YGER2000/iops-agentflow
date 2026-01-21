@@ -1,18 +1,7 @@
+"""RAG 智能体（当前默认实现）
+
+说明：
+- 目录名为 `rag_agent`，对外注册名也为 `rag_agent`。
+- 本实现自包含，不依赖任何历史目录代码。
 """
-RAG_Agent智能体
 
-负责基于检索增强生成的问答流程，包含查询解析、改写、检索调用、引用标注等能力。
-
-"""
-
-from .agent import RAGAgent
-from .state import RAGState, DomainContext, RetrievedSlice
-from .graph import build_rag_graph
-
-__all__ = [
-    "RAGAgent",
-    "RAGState",
-    "DomainContext",
-    "RetrievedSlice",
-    "build_rag_graph",
-]

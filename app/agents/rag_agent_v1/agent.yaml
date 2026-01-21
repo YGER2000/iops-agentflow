@@ -1,0 +1,11 @@
+name: rag_agent_v1
+version: 0.0.1
+description: 基于检索增强生成的问答智能体，支持输入标签进行过滤检索。
+author: 平台团队
+entry_class: RAGAgent
+enabled: false
+dependencies: []
+config:
+    RAG_AGENT_BASE_URL: ${RAG_AGENT_BASE_URL}
+    RAG_AGENT_USER_ID: ${RAG_AGENT_USER_ID}
+
